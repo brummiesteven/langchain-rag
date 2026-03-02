@@ -74,4 +74,9 @@ def get_retriever(k: int = 4) -> VectorStoreRetriever:
            4 is a common starting point for RAG applications.
     """
     vector_store = get_vector_store()
-    return vector_store.as_retriever(search_kwargs={"k": k})
+    # NOTE: Do NOT pass k in search_kwargs — the AzureSearch retriever already
+    # passes k=self.k explicitly, so including it in search_kwargs causes
+    # "got multiple values for keyword argument 'k'" in hybrid_search().
+    retriever = vector_store.as_retriever(search_type="similarity")
+    retriever.k = k
+    return retriever
