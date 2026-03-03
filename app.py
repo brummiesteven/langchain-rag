@@ -24,6 +24,7 @@ PAGE FLOW:
 """
 
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -147,7 +148,7 @@ with st.sidebar:
     if st.button("Clear Chat History"):
         from rag.chain import clear_session_history
 
-        clear_session_history(st.session_state.session_id)
+        clear_session_history(st.session_state.chain, st.session_state.session_id)
         st.session_state.messages = []
         # st.rerun() forces Streamlit to re-execute the script immediately,
         # which re-renders the UI with the now-empty message list.
@@ -182,18 +183,55 @@ elif prompt := st.chat_input("Ask a question about your documents"):
     # 2. Run the RAG chain and display the assistant's response
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            # Invoke the RAG chain with the user's question.
-            # session_id is passed via config so RunnableWithMessageHistory
-            # knows which conversation history to load/save.
-            result = st.session_state.chain.invoke(
-                {"question": prompt},
-                config={"configurable": {"session_id": st.session_state.session_id}},
-            )
+            # Invoke the RAG graph with the user's question.
+            # The HumanMessage is appended to the checkpointed messages
+            # via the add-reducer. thread_id keys the conversation state.
+            # The question is derived from messages[-1].content inside the
+            # graph — no need to pass it separately.
+            from langchain_community.callbacks import get_openai_callback
+            from langchain_core.messages import HumanMessage
+
+            # ── Response timing & token tracking ──────────────────────
+            # time.perf_counter() is a high-resolution monotonic clock —
+            # best choice for measuring elapsed wall-clock time.
+            # get_openai_callback() is a LangChain context manager that
+            # hooks into every OpenAI API call made inside the `with`
+            # block and accumulates token counts (prompt, completion,
+            # total). This captures ALL LLM calls in the pipeline:
+            # condense, summarize, and answer generation.
+            start_time = time.perf_counter()
+            with get_openai_callback() as cb:
+                result = st.session_state.chain.invoke(
+                    {"messages": [HumanMessage(content=prompt)]},
+                    config={
+                        "configurable": {
+                            "thread_id": st.session_state.session_id,
+                        }
+                    },
+                )
+            elapsed = time.perf_counter() - start_time
         answer = result["answer"]
         source_documents = result.get("source_documents", [])
 
+        # If the summarize_node compressed old messages on this turn,
+        # show a blue info banner so the user knows earlier context was
+        # condensed. This is non-blocking — the answer still appears normally.
+        if result.get("summarized"):
+            st.info("Chat history was compacted to stay within token limits. Earlier messages have been summarized.")
+
         # Display the answer text
         st.markdown(answer)
+
+        # Display response stats below the answer as small grey text.
+        # st.caption() renders in a smaller, muted font — subtle but visible.
+        # Token counts come from the OpenAI callback (cb) which tracked all
+        # API calls during the invoke. The :, format adds thousand separators
+        # for readability (e.g. 1,234 instead of 1234).
+        st.caption(
+            f"Response time: {elapsed:.1f}s | "
+            f"Tokens: {cb.total_tokens:,} "
+            f"(prompt: {cb.prompt_tokens:,}, completion: {cb.completion_tokens:,})"
+        )
 
         # Display source citations in a collapsible section.
         # This lets users verify the answer by seeing which document chunks

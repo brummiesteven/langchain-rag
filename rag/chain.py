@@ -1,94 +1,129 @@
-"""Core RAG chain with conversational memory.
+"""Core RAG chain with conversational memory using LangGraph.
 
 RAG = Retrieval Augmented Generation. Instead of the LLM answering from its
 training data alone, we first RETRIEVE relevant documents from a vector store,
 then GENERATE an answer grounded in those documents. This dramatically reduces
 hallucination and lets the LLM answer questions about YOUR specific documents.
 
-THE PIPELINE (5 stages):
+THE PIPELINE (5 stages, expressed as a LangGraph StateGraph):
 
   User asks: "What about Q3?"
        │
        ▼
-  ┌─ Stage 1: CONDENSE ─────────────────────────────────────────────────┐
-  │ If there's chat history, rewrite the follow-up question into a     │
-  │ standalone question. "What about Q3?" → "What does the financial   │
-  │ report say about Q3 performance?" Without this, the retriever      │
-  │ would search for "What about Q3?" and get irrelevant results.      │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Stage 1: SUMMARIZE ──────────────────────────────────────────────────┐
+  │ If conversation history exceeds _MAX_HISTORY_TOKENS, summarize       │
+  │ older messages and remove them from state. The summary is stored     │
+  │ in the `summary` field and injected into prompts at read-time.       │
+  │ Keeps the last _KEEP_MESSAGES messages verbatim for context.         │
+  └────────────────────────────────────────────────────────────────────────┘
        │
        ▼
-  ┌─ Stage 2: RETRIEVE ─────────────────────────────────────────────────┐
-  │ The standalone question is converted to a vector (embedding) and   │
-  │ used to search Azure AI Search for the top 4 most similar document │
-  │ chunks. Returns a list of Document objects with page_content.      │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Stage 2: CONDENSE ───────────────────────────────────────────────────┐
+  │ If there's chat history, rewrite the follow-up question into a       │
+  │ standalone question. "What about Q3?" → "What does the financial     │
+  │ report say about Q3 performance?"                                    │
+  └────────────────────────────────────────────────────────────────────────┘
        │
        ▼
-  ┌─ Stage 3: FORMAT CONTEXT ───────────────────────────────────────────┐
-  │ Join the retrieved document chunks into a single string separated  │
-  │ by double newlines. This string gets inserted into the prompt      │
-  │ template as the {context} variable.                                │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Stage 3: RETRIEVE ───────────────────────────────────────────────────┐
+  │ The standalone question is converted to a vector and used to search  │
+  │ Azure AI Search for the top 4 most similar document chunks.          │
+  └────────────────────────────────────────────────────────────────────────┘
        │
        ▼
-  ┌─ Stage 4: GENERATE ANSWER ──────────────────────────────────────────┐
-  │ The RAG prompt (with context + question) is sent to the LLM.       │
-  │ The LLM generates an answer based ONLY on the provided context.    │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Stage 4: FORMAT CONTEXT ─────────────────────────────────────────────┐
+  │ Join the retrieved document chunks into a single string separated    │
+  │ by double newlines. This string gets inserted into the prompt.       │
+  └────────────────────────────────────────────────────────────────────────┘
        │
        ▼
-  ┌─ Stage 5: CLEAN OUTPUT ─────────────────────────────────────────────┐
-  │ Strip intermediate keys (standalone_question, context) and return  │
-  │ only {"answer": "...", "source_documents": [...]}.                 │
-  └─────────────────────────────────────────────────────────────────────┘
-
-LCEL (LangChain Expression Language):
-  The chain is built using LCEL, which lets you compose steps with the | (pipe)
-  operator. Data flows left to right, like Unix pipes. Each stage receives the
-  output of the previous stage as its input.
+  ┌─ Stage 5: GENERATE ANSWER ────────────────────────────────────────────┐
+  │ The RAG prompt (with context + question + history) is sent to the    │
+  │ LLM. The AI response is appended to messages for history tracking.   │
+  └────────────────────────────────────────────────────────────────────────┘
 
 CHAT HISTORY:
-  RunnableWithMessageHistory wraps the chain and automatically loads/saves
-  conversation history per session_id. This lets users have multi-turn
-  conversations ("Tell me more about that" works because history provides context).
-  History is stored in-memory and lost on restart — fine for a single-process app.
+  LangGraph's InMemorySaver checkpointer persists conversation state per
+  thread_id. Each Streamlit browser tab gets a unique thread_id (UUID).
+  The summarize node compresses old messages when history exceeds a token
+  threshold — functionally equivalent to SummarizationMiddleware but
+  implemented as a graph node (the native pattern for custom StateGraphs).
+
+  The summary is stored ONLY in the `summary` state field (single source of
+  truth) and injected into prompts via _build_chat_history() at read-time.
+  This avoids SystemMessage accumulation in the messages list.
+
+  History is stored in-memory and lost on restart — fine for a single-process
+  app. For production, swap InMemorySaver for PostgresSaver.
 """
 
-from langchain_core.chat_history import InMemoryChatMessageHistory
+from __future__ import annotations
+
+import logging
+
+from typing import Annotated  # noqa: F401 — required for get_type_hints() on Python 3.9
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+# Python's logging module lets us emit structured messages at different severity
+# levels (DEBUG, INFO, WARNING, ERROR). getLogger(__name__) creates a logger
+# named after this module (e.g. "rag.chain"), so log output can be filtered
+# per-module. By default, only WARNING+ is shown; set logging.basicConfig(level=
+# logging.DEBUG) in your entry point to see everything.
+
 from langchain_core.documents import Document
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,  # noqa: F401 — required for get_type_hints() on Python 3.9
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+)
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph.message import add_messages  # noqa: F401 — required for get_type_hints() on Python 3.9
+
+logger = logging.getLogger(__name__)
 
 from rag.llm import get_llm
 from rag.prompts import CONDENSE_PROMPT, RAG_PROMPT
 from rag.vectorstore import get_retriever
 
-# ─── Session History Storage ──────────────────────────────────────────────────
-# A simple in-memory dict mapping session_id -> InMemoryChatMessageHistory.
-# Each Streamlit browser tab gets a unique session_id (a UUID).
-# NOT persistent — all history is lost when the Python process restarts.
-# For production, you'd swap this for Redis, Cosmos DB, or a database.
-_session_histories: dict[str, InMemoryChatMessageHistory] = {}
+# ─── Summarization Settings ──────────────────────────────────────────────────
+# When conversation history exceeds _MAX_HISTORY_TOKENS, older messages are
+# summarized into a concise text stored in the `summary` state field. The most
+# recent _KEEP_MESSAGES are kept verbatim for immediate conversational context.
+# 3 Q&A turns = 6 messages, which typically exceed 500 tokens. So on the 4th
+# question, the oldest messages are summarized and the last 2 Q&A pairs (4
+# messages) are kept verbatim. This keeps context tight and costs low.
+_MAX_HISTORY_TOKENS = 500
+_KEEP_MESSAGES = 4
 
 
-def _get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    """Return the chat history for a session, creating a new one if needed.
+# ─── State Schema ─────────────────────────────────────────────────────────────
 
-    This function is passed to RunnableWithMessageHistory. Before each chain
-    invocation, LangChain calls this to get the history object for the current
-    session, then injects the stored messages into the prompt template.
+
+class RAGState(MessagesState):
+    """Graph state extending MessagesState with RAG pipeline fields.
+
+    MessagesState provides `messages` with an add-reducer that automatically
+    appends new messages and handles RemoveMessage for deletion. The
+    checkpointer persists the full state (including messages) per thread_id.
     """
-    if session_id not in _session_histories:
-        _session_histories[session_id] = InMemoryChatMessageHistory()
-    return _session_histories[session_id]
+
+    standalone_question: str
+    source_documents: list[Document]
+    context: str
+    answer: str
+    summary: str
+    # Flag set by summarize_node — True when old messages were actually
+    # compressed in this invocation. The frontend reads this to show a
+    # "history compacted" indicator so the user knows what happened.
+    summarized: bool
 
 
-def clear_session_history(session_id: str) -> None:
-    """Clear all messages for a given session (called by the UI's clear button)."""
-    if session_id in _session_histories:
-        _session_histories[session_id].clear()
+# ─── Utility Functions ────────────────────────────────────────────────────────
 
 
 def format_docs(docs: list[Document]) -> str:
@@ -105,123 +140,235 @@ def format_docs(docs: list[Document]) -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def get_rag_chain() -> RunnableWithMessageHistory:
-    """Build the full RAG chain with chat history support.
+def _build_chat_history(messages: list, summary: str = "") -> list:
+    """Build chat_history for prompt templates from state.
+
+    Constructs the message list that gets injected into CONDENSE_PROMPT and
+    RAG_PROMPT via MessagesPlaceholder("chat_history"). Excludes the last
+    message (current user input) and optionally prepends the running
+    conversation summary as a SystemMessage.
+
+    The summary is stored in the `summary` state field (NOT as a message in
+    the messages list) to avoid accumulation. It is only materialised here,
+    at read-time, when building prompt inputs.
+
+    Args:
+        messages: Full message list from state (including current user message).
+        summary: Running conversation summary text, if any.
+
+    Returns:
+        List of messages suitable for prompt chat_history.
+    """
+    if not messages:
+        return []
+    history = list(messages[:-1])
+    if summary:
+        summary_msg = SystemMessage(
+            content=f"Summary of earlier conversation: {summary}"
+        )
+        return [summary_msg] + history
+    return history
+
+
+# ─── Module-level Checkpointer ────────────────────────────────────────────────
+# Shared across all threads. Each thread_id gets its own conversation state.
+# NOT persistent — all history is lost when the Python process restarts.
+# For production, swap for PostgresSaver or another durable backend.
+_checkpointer = InMemorySaver()
+
+
+def get_rag_chain():
+    """Build the full RAG graph with checkpointer and conversation summarization.
 
     This is the main entry point for the app. It assembles the entire pipeline
-    and returns a chain that can be invoked with:
-        chain.invoke(
-            {"question": "user's question"},
-            config={"configurable": {"session_id": "some-uuid"}}
+    as a LangGraph StateGraph and returns a compiled graph that can be invoked:
+        graph.invoke(
+            {"messages": [HumanMessage(content="...")]},
+            config={"configurable": {"thread_id": "some-uuid"}}
         )
 
-    Returns a dict with:
+    The question is derived from the last message in state — no need to pass
+    it separately. Returns a compiled StateGraph. The result dict contains:
       - "answer": the generated response string
       - "source_documents": list of retrieved Document objects (for citations)
     """
-    # Create the LLM (chat model) and retriever (vector search) instances.
-    # These are created once when the chain is built. The chain itself is
-    # cached in st.session_state, so this only runs once per Streamlit session.
     llm = get_llm()
     retriever = get_retriever()
 
-    # Sub-chain for Stage 1: takes chat_history + question, outputs a
-    # standalone question string. Uses LCEL pipe syntax:
+    # Sub-chains for the condense and answer steps (same LCEL as before).
     # prompt template → LLM → extract string from LLM response
     condense_chain = CONDENSE_PROMPT | llm | StrOutputParser()
-
-    def condense_question(input: dict) -> str:
-        """Rewrite follow-ups into standalone questions; pass-through if no history.
-
-        If there's no chat history (first message in the conversation), we skip
-        the condense step entirely and just use the question as-is. This avoids
-        an unnecessary LLM call on the first turn.
-        """
-        if input.get("chat_history"):
-            return condense_chain.invoke(input)
-        return input["question"]
-
-    # Sub-chain for Stage 4: takes context + question, outputs an answer string.
-    # RAG_PROMPT contains the system instructions ("answer based only on context")
-    # plus placeholders for {context}, {question}, and chat_history.
     answer_chain = RAG_PROMPT | llm | StrOutputParser()
 
-    # ─── The Main Pipeline ────────────────────────────────────────────────
-    # Built using RunnablePassthrough.assign() which passes the input dict
-    # through unchanged BUT adds a new key computed by the function/chain.
-    # At each stage, the dict accumulates more keys.
-    #
-    # Input dict starts as: {"question": "user's question", "chat_history": [...]}
-    rag_chain = (
-        # Stage 1: Add "standalone_question" key to the dict.
-        # If there's chat history, this rewrites the question to be self-contained.
-        # After this: {..., "standalone_question": "rewritten question"}
-        RunnablePassthrough.assign(
-            standalone_question=condense_question,
+    # ─── Node Functions ───────────────────────────────────────────────────
+
+    def summarize_node(state: RAGState) -> dict:
+        """Compress old messages when history exceeds token threshold.
+
+        Runs before every pipeline execution. If the conversation history
+        (excluding the current user message) exceeds _MAX_HISTORY_TOKENS AND
+        there are more than _KEEP_MESSAGES messages, older messages are removed
+        from state and replaced with a concise summary stored in the `summary`
+        field. The summary is NOT added as a SystemMessage to messages — it is
+        injected into prompts at read-time via _build_chat_history().
+
+        On failure (e.g. transient LLM error), summarization is skipped
+        gracefully and the user's question is still answered.
+        """
+        messages = state["messages"]
+        # Only look at history before the current user message
+        history = messages[:-1]
+
+        if not history or len(history) <= _KEEP_MESSAGES:
+            return {"summarized": False}
+
+        token_count = count_tokens_approximately(history)
+        if token_count <= _MAX_HISTORY_TOKENS:
+            return {"summarized": False}
+
+        logger.info("Summarization triggered: %d messages, ~%d tokens in history",
+                     len(history), token_count)
+        logger.debug("Keeping last %d messages, summarizing %d older messages",
+                      _KEEP_MESSAGES, len(history) - _KEEP_MESSAGES)
+
+        to_summarize = history[:-_KEEP_MESSAGES]
+
+        # Build the summarization prompt, incorporating any existing summary
+        existing_summary = state.get("summary", "")
+        if existing_summary:
+            prompt = (
+                f"This is an existing summary of the conversation:\n"
+                f"{existing_summary}\n\n"
+                "Extend the summary by incorporating the following new messages:\n\n"
+            )
+        else:
+            prompt = (
+                "Create a concise summary of the following conversation:\n\n"
+            )
+
+        for msg in to_summarize:
+            if isinstance(msg, HumanMessage):
+                role = "User"
+            elif isinstance(msg, AIMessage):
+                role = "Assistant"
+            else:
+                role = "System"
+            prompt += f"{role}: {msg.content}\n"
+
+        prompt += "\nProvide a concise summary preserving key facts and context:"
+
+        try:
+            summary = llm.invoke([HumanMessage(content=prompt)]).content
+        except Exception:
+            logger.warning("Summarization failed; skipping and continuing pipeline")
+            return {"summarized": False}
+
+        # Remove old messages via RemoveMessage (processed by the add-reducer).
+        # Summary is stored in state only — NOT as a SystemMessage in messages.
+        delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize]
+
+        return {
+            "summary": summary,
+            "messages": delete_msgs,
+            "summarized": True,
+        }
+
+    def condense_node(state: RAGState) -> dict:
+        """Rewrite follow-ups into standalone questions; pass-through if no history.
+
+        The question is derived from the last message in state (always a
+        HumanMessage). If there's no prior chat history, we skip the condense
+        step entirely to avoid an unnecessary LLM call on the first turn.
+        """
+        question = state["messages"][-1].content
+        history = _build_chat_history(
+            state["messages"], state.get("summary", "")
         )
-        # Stage 2: Add "source_documents" key — the retrieved document chunks.
-        # Uses the standalone question (not the original) for better retrieval.
-        # After this: {..., "source_documents": [Document, Document, ...]}
-        | RunnablePassthrough.assign(
-            source_documents=lambda x: retriever.invoke(x["standalone_question"]),
+
+        if history:
+            logger.info("Condensing follow-up question with %d history messages", len(history))
+            standalone = condense_chain.invoke(
+                {"chat_history": history, "question": question}
+            )
+            logger.debug("Standalone question: %s", standalone)
+            return {"standalone_question": standalone}
+        logger.info("First turn — skipping condense step")
+        return {"standalone_question": question}
+
+    def retrieve_node(state: RAGState) -> dict:
+        """Retrieve relevant documents using the standalone question."""
+        query = state["standalone_question"]
+        docs = retriever.invoke(query)
+        logger.info("Retrieved %d documents for query: %s", len(docs), query)
+        return {"source_documents": docs}
+
+    def format_context_node(state: RAGState) -> dict:
+        """Format retrieved documents into a context string."""
+        return {"context": format_docs(state["source_documents"])}
+
+    def generate_answer_node(state: RAGState) -> dict:
+        """Generate the final answer and append AI response to messages.
+
+        The answer chain receives the formatted document context, chat history
+        (with summary prepended if present), and standalone question. The AI
+        response is appended to messages so the checkpointer persists it for
+        future turns.
+        """
+        logger.info("Generating answer")
+        history = _build_chat_history(
+            state["messages"], state.get("summary", "")
         )
-        # Stage 3: Add "context" key (formatted docs string) and copy the
-        # standalone question into "question" (overwriting the original).
-        # The answer_chain's prompt template expects {context} and {question}.
-        | RunnablePassthrough.assign(
-            context=lambda x: format_docs(x["source_documents"]),
-            question=lambda x: x["standalone_question"],
-        )
-        # Stage 4: Add "answer" key — the LLM's generated response.
-        # answer_chain reads {context}, {question}, and {chat_history} from the dict.
-        | RunnablePassthrough.assign(
-            answer=answer_chain,
-        )
-        # Stage 5: Drop all intermediate keys (standalone_question, context, etc.)
-        # and return only what the UI needs: the answer text and source documents.
-        | RunnableLambda(
-            lambda x: {
-                "answer": x["answer"],
-                "source_documents": x["source_documents"],
+        answer = answer_chain.invoke(
+            {
+                "context": state["context"],
+                "chat_history": history,
+                "question": state["standalone_question"],
             }
         )
-    )
+        logger.debug("Answer length: %d characters", len(answer))
+        return {
+            "answer": answer,
+            "messages": [AIMessage(content=answer)],
+        }
 
-    # Wrap the chain with automatic chat history management.
-    # RunnableWithMessageHistory does the following on each invoke():
-    #   1. Calls _get_session_history(session_id) to get the history object
-    #   2. Injects past messages into the chain input under "chat_history"
-    #   3. After the chain runs, saves the user's question as a HumanMessage
-    #      and the answer as an AIMessage to the history
-    return RunnableWithMessageHistory(
-        rag_chain,
-        _get_session_history,
-        input_messages_key="question",       # Which input key is the user's message
-        history_messages_key="chat_history",  # Which key the prompt expects for history
-        output_messages_key="answer",         # Which output key is the AI's response
-    )
+    # ─── Build the Graph ──────────────────────────────────────────────────
+
+    builder = StateGraph(RAGState)
+    builder.add_node("summarize", summarize_node)
+    builder.add_node("condense", condense_node)
+    builder.add_node("retrieve", retrieve_node)
+    builder.add_node("format_context", format_context_node)
+    builder.add_node("generate_answer", generate_answer_node)
+
+    builder.add_edge(START, "summarize")
+    builder.add_edge("summarize", "condense")
+    builder.add_edge("condense", "retrieve")
+    builder.add_edge("retrieve", "format_context")
+    builder.add_edge("format_context", "generate_answer")
+    builder.add_edge("generate_answer", END)
+
+    return builder.compile(checkpointer=_checkpointer)
 
 
-def get_simple_rag_chain():
-    """One-shot RAG chain without history — useful for CLI testing.
+def clear_session_history(graph, thread_id: str) -> None:
+    """Clear all messages and summary for a given thread.
 
-    A simpler version that skips the condense step and chat history.
-    Good for testing retrieval + generation without the complexity of
-    multi-turn conversation management.
-
-    Usage:
-        chain = get_simple_rag_chain()
-        answer = chain.invoke({"question": "What is X?"})
+    Uses graph.get_state / graph.update_state to remove all messages via
+    RemoveMessage, which updates the checkpointed state. This is the LangGraph
+    equivalent of clearing the in-memory session history dict.
     """
-    llm = get_llm()
-    retriever = get_retriever()
+    if graph is None:
+        return
 
-    return (
-        # Retrieve docs and format as context string in one step
-        RunnablePassthrough.assign(
-            context=lambda x: format_docs(retriever.invoke(x["question"])),
-        )
-        | RAG_PROMPT     # Fill in the prompt template with context + question
-        | llm            # Send to the LLM
-        | StrOutputParser()  # Extract the text from the LLM's response
-    )
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = graph.get_state(config)
+    except (ValueError, KeyError):
+        return  # Thread doesn't exist — nothing to clear
+
+    if not state.values or not state.values.get("messages"):
+        return
+
+    delete_messages = [RemoveMessage(id=m.id) for m in state.values["messages"]]
+    if delete_messages:
+        graph.update_state(config, {"messages": delete_messages, "summary": ""})
