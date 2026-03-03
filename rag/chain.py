@@ -63,13 +63,6 @@ import logging
 
 from typing import Annotated  # noqa: F401 — required for get_type_hints() on Python 3.9
 
-# ─── Logging ─────────────────────────────────────────────────────────────────
-# Python's logging module lets us emit structured messages at different severity
-# levels (DEBUG, INFO, WARNING, ERROR). getLogger(__name__) creates a logger
-# named after this module (e.g. "rag.chain"), so log output can be filtered
-# per-module. By default, only WARNING+ is shown; set logging.basicConfig(level=
-# logging.DEBUG) in your entry point to see everything.
-
 from langchain_core.documents import Document
 from langchain_core.messages import (
     AIMessage,
@@ -84,8 +77,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.message import add_messages  # noqa: F401 — required for get_type_hints() on Python 3.9
 
+# ─── Logging ─────────────────────────────────────────────────────────────────
+# Python's logging module lets us emit structured messages at different severity
+# levels (DEBUG, INFO, WARNING, ERROR). getLogger(__name__) creates a logger
+# named after this module (e.g. "rag.chain"), so log output can be filtered
+# per-module. By default, only WARNING+ is shown; set logging.basicConfig(level=
+# logging.DEBUG) in your entry point to see everything.
 logger = logging.getLogger(__name__)
 
+# ─── Local Imports ───────────────────────────────────────────────────────────
+# These import from other modules in the rag package. They're separated from
+# third-party imports above to follow Python convention (stdlib → third-party →
+# local). Each provides a factory function used to build the RAG pipeline.
 from rag.llm import get_llm
 from rag.prompts import CONDENSE_PROMPT, RAG_PROMPT
 from rag.vectorstore import get_retriever
@@ -332,14 +335,25 @@ def get_rag_chain():
         }
 
     # ─── Build the Graph ──────────────────────────────────────────────────
+    # LangGraph models pipelines as directed graphs. You define NODES (functions
+    # that process state) and EDGES (the order they execute in). StateGraph
+    # manages a shared state dict (RAGState) that flows through each node —
+    # each node reads what it needs from state and returns updates to merge back.
 
     builder = StateGraph(RAGState)
+
+    # Register each node function with a string name.
+    # The name is used when defining edges and appears in debug traces.
     builder.add_node("summarize", summarize_node)
     builder.add_node("condense", condense_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("format_context", format_context_node)
     builder.add_node("generate_answer", generate_answer_node)
 
+    # Wire nodes into a linear pipeline: START → summarize → condense →
+    # retrieve → format_context → generate_answer → END.
+    # START and END are special sentinel nodes provided by LangGraph.
+    # For branching/conditional flows, you'd use add_conditional_edges() instead.
     builder.add_edge(START, "summarize")
     builder.add_edge("summarize", "condense")
     builder.add_edge("condense", "retrieve")
@@ -347,6 +361,8 @@ def get_rag_chain():
     builder.add_edge("format_context", "generate_answer")
     builder.add_edge("generate_answer", END)
 
+    # compile() freezes the graph structure and attaches the checkpointer.
+    # The checkpointer persists state between invocations (conversation memory).
     return builder.compile(checkpointer=_checkpointer)
 
 
