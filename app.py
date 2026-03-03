@@ -162,16 +162,30 @@ with st.sidebar:
         st.rerun()
 
     # ─── Conversation Status ──────────────────────────────────────────────
-    # Persistent indicator that survives Streamlit reruns because it reads
-    # from session_state (not from a one-shot result dict). Once the
-    # summarize_node compresses old messages, this stays visible until the
-    # user clears the chat.
+    # Always-visible indicator showing how close the conversation is to
+    # triggering history compression. Each Q&A turn adds 2 messages.
+    # Compression fires when history (all messages before the current input)
+    # exceeds _KEEP_MESSAGES, so the practical trigger point in the UI's
+    # message list is _KEEP_MESSAGES + 2 total messages.
+    st.divider()
+    st.caption("Conversation Status")
+
+    from rag.chain import _KEEP_MESSAGES
+
+    msg_count = len(st.session_state.messages)
+    # Threshold: need > _KEEP_MESSAGES in history, which means
+    # _KEEP_MESSAGES + 2 total messages (history + current Q&A pair).
+    threshold = _KEEP_MESSAGES + 2
+
     if st.session_state.history_summarized:
-        st.divider()
-        st.info(
-            "Chat history has been compacted. "
-            "Older messages were summarized to stay within token limits."
-        )
+        # Post-compression: show compacted indicator with ongoing count
+        st.markdown("✓ **History compacted**")
+        st.caption(f"Messages: {msg_count} (oldest summarized)")
+    else:
+        # Pre-compression: show progress toward compression threshold
+        progress = min(msg_count / threshold, 1.0) if threshold > 0 else 0.0
+        st.progress(progress)
+        st.caption(f"{msg_count} / {threshold} messages until compression")
 
 # ─── Chat Display ─────────────────────────────────────────────────────────────
 # Re-render all previous messages from session_state on each rerun.
