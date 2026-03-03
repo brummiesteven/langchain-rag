@@ -161,31 +161,8 @@ with st.sidebar:
         # which re-renders the UI with the now-empty message list.
         st.rerun()
 
-    # ─── Conversation Status ──────────────────────────────────────────────
-    # Always-visible indicator showing how close the conversation is to
-    # triggering history compression. Each Q&A turn adds 2 messages.
-    # Compression fires when history (all messages before the current input)
-    # exceeds _KEEP_MESSAGES, so the practical trigger point in the UI's
-    # message list is _KEEP_MESSAGES + 2 total messages.
-    st.divider()
-    st.caption("Conversation Status")
-
-    from rag.chain import _KEEP_MESSAGES
-
-    msg_count = len(st.session_state.messages)
-    # Threshold: need > _KEEP_MESSAGES in history, which means
-    # _KEEP_MESSAGES + 2 total messages (history + current Q&A pair).
-    threshold = _KEEP_MESSAGES + 2
-
-    if st.session_state.history_summarized:
-        # Post-compression: show compacted indicator with ongoing count
-        st.markdown("✓ **History compacted**")
-        st.caption(f"Messages: {msg_count} (oldest summarized)")
-    else:
-        # Pre-compression: show progress toward compression threshold
-        progress = min(msg_count / threshold, 1.0) if threshold > 0 else 0.0
-        st.progress(progress)
-        st.caption(f"{msg_count} / {threshold} messages until compression")
+    # Conversation status is rendered at the end of the script (after
+    # messages are appended to session_state) so the count is always current.
 
 # ─── Chat Display ─────────────────────────────────────────────────────────────
 # Re-render all previous messages from session_state on each rerun.
@@ -309,3 +286,28 @@ elif prompt := st.chat_input("Ask a question about your documents"):
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "sources": sources, "llm_io": llm_io}
     )
+
+# ─── Sidebar: Conversation Status ────────────────────────────────────────────
+# Rendered AFTER the chat input handler so st.session_state.messages includes
+# any messages appended during this rerun. Using st.sidebar.<widget> outside
+# the `with st.sidebar:` block appends to the sidebar at the current point
+# in script execution — giving us an accurate, always-current message count.
+from rag.chain import _KEEP_MESSAGES
+
+msg_count = len(st.session_state.messages)
+# Threshold: need > _KEEP_MESSAGES in history, which means
+# _KEEP_MESSAGES + 2 total messages (history + current Q&A pair).
+threshold = _KEEP_MESSAGES + 2
+
+st.sidebar.divider()
+st.sidebar.caption("Conversation Status")
+
+if st.session_state.history_summarized:
+    # Post-compression: show compacted indicator with ongoing count
+    st.sidebar.markdown("✓ **History compacted**")
+    st.sidebar.caption(f"Messages: {msg_count} (oldest summarized)")
+else:
+    # Pre-compression: show progress toward compression threshold
+    progress = min(msg_count / threshold, 1.0) if threshold > 0 else 0.0
+    st.sidebar.progress(progress)
+    st.sidebar.caption(f"{msg_count} / {threshold} messages until compression")
