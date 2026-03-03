@@ -82,6 +82,12 @@ if "chain" not in st.session_state:
     # store None so the UI can check and disable inputs accordingly.
     st.session_state.chain = _get_chain() if _configured else None
 
+if "history_summarized" not in st.session_state:
+    # Tracks whether the conversation history has been compacted at least once.
+    # Once True, the sidebar shows a persistent indicator so the user knows
+    # older messages have been condensed into a summary. Reset on "Clear Chat".
+    st.session_state.history_summarized = False
+
 # ─── Sidebar: Document Upload + Controls ──────────────────────────────────────
 with st.sidebar:
     # Show a warning if credentials aren't set up
@@ -150,9 +156,22 @@ with st.sidebar:
 
         clear_session_history(st.session_state.chain, st.session_state.session_id)
         st.session_state.messages = []
+        st.session_state.history_summarized = False
         # st.rerun() forces Streamlit to re-execute the script immediately,
         # which re-renders the UI with the now-empty message list.
         st.rerun()
+
+    # ─── Conversation Status ──────────────────────────────────────────────
+    # Persistent indicator that survives Streamlit reruns because it reads
+    # from session_state (not from a one-shot result dict). Once the
+    # summarize_node compresses old messages, this stays visible until the
+    # user clears the chat.
+    if st.session_state.history_summarized:
+        st.divider()
+        st.info(
+            "Chat history has been compacted. "
+            "Older messages were summarized to stay within token limits."
+        )
 
 # ─── Chat Display ─────────────────────────────────────────────────────────────
 # Re-render all previous messages from session_state on each rerun.
@@ -167,6 +186,14 @@ for msg in st.session_state.messages:
                 for i, src in enumerate(msg["sources"], 1):
                     st.markdown(f"**{i}. {src['name']}**")
                     st.caption(src["snippet"])
+        # If this message has LLM call data, show prompts and responses
+        if msg.get("llm_io"):
+            with st.expander(f"LLM Calls ({len(msg['llm_io'])})"):
+                for call in msg["llm_io"]:
+                    st.markdown(f"**{call['label']}**")
+                    st.code(call["prompt"], language=None)
+                    st.markdown("**Response:**")
+                    st.code(call["response"], language=None)
 
 # ─── Chat Input ───────────────────────────────────────────────────────────────
 # st.chat_input returns the user's message when they press Enter, or None.
@@ -214,10 +241,9 @@ elif prompt := st.chat_input("Ask a question about your documents"):
         source_documents = result.get("source_documents", [])
 
         # If the summarize_node compressed old messages on this turn,
-        # show a blue info banner so the user knows earlier context was
-        # condensed. This is non-blocking — the answer still appears normally.
+        # flip the session flag so the sidebar indicator persists across reruns.
         if result.get("summarized"):
-            st.info("Chat history was compacted to stay within token limits. Earlier messages have been summarized.")
+            st.session_state.history_summarized = True
 
         # Display the answer text
         st.markdown(answer)
@@ -253,7 +279,19 @@ elif prompt := st.chat_input("Ask a question about your documents"):
                     st.caption(snippet)
                     sources.append({"name": name, "snippet": snippet})
 
+        # Display LLM prompts and responses in a collapsible section.
+        # This shows the rendered prompt sent to the LLM and its raw response
+        # for each pipeline stage (condense, summarize, answer generation).
+        llm_io = result.get("llm_io", [])
+        if llm_io:
+            with st.expander(f"LLM Calls ({len(llm_io)})"):
+                for call in llm_io:
+                    st.markdown(f"**{call['label']}**")
+                    st.code(call["prompt"], language=None)
+                    st.markdown("**Response:**")
+                    st.code(call["response"], language=None)
+
     # 3. Save the assistant's response to session state for re-rendering
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
+        {"role": "assistant", "content": answer, "sources": sources, "llm_io": llm_io}
     )

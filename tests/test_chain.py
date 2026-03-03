@@ -181,13 +181,10 @@ def test_graph_compiles(mock_get_llm, mock_get_retriever):
 # verifying that state flows correctly through all nodes.
 
 def _make_mock_llm():
-    """Create a mock LLM that works with both LCEL chains and direct calls."""
+    """Create a mock LLM that returns a fixed response for all .invoke() calls."""
     mock_llm = MagicMock()
-    # For LCEL chains: PROMPT | mock_llm | StrOutputParser()
-    # The mock is wrapped in RunnableLambda, called directly → .return_value
-    mock_llm.return_value = AIMessage(content="mocked answer")
-    # For direct calls: llm.invoke([...]) in summarize_node
-    mock_llm.invoke.return_value = AIMessage(content="mocked summary")
+    # All nodes now call llm.invoke() directly (no LCEL chains).
+    mock_llm.invoke.return_value = AIMessage(content="mocked answer")
     return mock_llm
 
 
@@ -272,7 +269,7 @@ def test_summarization_prunes_old_messages(mock_get_llm, mock_get_retriever):
     state = graph.get_state(config)
 
     # Summary should be populated
-    assert state.values.get("summary") == "mocked summary"
+    assert state.values.get("summary") == "mocked answer"
     # Summarized flag should be set
     assert state.values.get("summarized") is True
     # Messages should be bounded: kept messages (Q2, A2) + current turn (Q3, A3)

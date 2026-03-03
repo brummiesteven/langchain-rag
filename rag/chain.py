@@ -60,6 +60,7 @@ CHAT HISTORY:
 from __future__ import annotations
 
 import logging
+import operator
 
 from typing import Annotated  # noqa: F401 — required for get_type_hints() on Python 3.9
 
@@ -72,7 +73,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_core.messages.utils import count_tokens_approximately
-from langchain_core.output_parsers import StrOutputParser
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.message import add_messages  # noqa: F401 — required for get_type_hints() on Python 3.9
@@ -124,6 +124,10 @@ class RAGState(MessagesState):
     # compressed in this invocation. The frontend reads this to show a
     # "history compacted" indicator so the user knows what happened.
     summarized: bool
+    # Accumulates LLM prompt/response pairs from each pipeline node.
+    # operator.add tells LangGraph to concatenate lists from each node
+    # rather than overwriting, so {"llm_io": [item]} from each node stacks up.
+    llm_io: Annotated[list, operator.add]
 
 
 # ─── Utility Functions ────────────────────────────────────────────────────────
@@ -173,6 +177,26 @@ def _build_chat_history(messages: list, summary: str = "") -> list:
     return history
 
 
+def _format_messages(msgs) -> str:
+    """Format a list of LangChain messages into a readable multi-line string.
+
+    Each message is prefixed with its role label (System/Human/AI) so the
+    rendered prompt is easy to read in the frontend expander.
+    """
+    lines = []
+    for m in msgs:
+        if isinstance(m, SystemMessage):
+            role = "System"
+        elif isinstance(m, HumanMessage):
+            role = "Human"
+        elif isinstance(m, AIMessage):
+            role = "AI"
+        else:
+            role = type(m).__name__
+        lines.append(f"{role}: {m.content}")
+    return "\n\n".join(lines)
+
+
 # ─── Module-level Checkpointer ────────────────────────────────────────────────
 # Shared across all threads. Each thread_id gets its own conversation state.
 # NOT persistent — all history is lost when the Python process restarts.
@@ -198,11 +222,6 @@ def get_rag_chain():
     llm = get_llm()
     retriever = get_retriever()
 
-    # Sub-chains for the condense and answer steps (same LCEL as before).
-    # prompt template → LLM → extract string from LLM response
-    condense_chain = CONDENSE_PROMPT | llm | StrOutputParser()
-    answer_chain = RAG_PROMPT | llm | StrOutputParser()
-
     # ─── Node Functions ───────────────────────────────────────────────────
 
     def summarize_node(state: RAGState) -> dict:
@@ -223,11 +242,11 @@ def get_rag_chain():
         history = messages[:-1]
 
         if not history or len(history) <= _KEEP_MESSAGES:
-            return {"summarized": False}
+            return {"summarized": False, "llm_io": []}
 
         token_count = count_tokens_approximately(history)
         if token_count <= _MAX_HISTORY_TOKENS:
-            return {"summarized": False}
+            return {"summarized": False, "llm_io": []}
 
         logger.info("Summarization triggered: %d messages, ~%d tokens in history",
                      len(history), token_count)
@@ -261,10 +280,11 @@ def get_rag_chain():
         prompt += "\nProvide a concise summary preserving key facts and context:"
 
         try:
-            summary = llm.invoke([HumanMessage(content=prompt)]).content
+            response = llm.invoke([HumanMessage(content=prompt)])
+            summary = response.content
         except Exception:
             logger.warning("Summarization failed; skipping and continuing pipeline")
-            return {"summarized": False}
+            return {"summarized": False, "llm_io": []}
 
         # Remove old messages via RemoveMessage (processed by the add-reducer).
         # Summary is stored in state only — NOT as a SystemMessage in messages.
@@ -274,6 +294,11 @@ def get_rag_chain():
             "summary": summary,
             "messages": delete_msgs,
             "summarized": True,
+            "llm_io": [{
+                "label": "Summarize History",
+                "prompt": prompt,
+                "response": summary,
+            }],
         }
 
     def condense_node(state: RAGState) -> dict:
@@ -290,13 +315,22 @@ def get_rag_chain():
 
         if history:
             logger.info("Condensing follow-up question with %d history messages", len(history))
-            standalone = condense_chain.invoke(
-                {"chat_history": history, "question": question}
+            rendered = CONDENSE_PROMPT.format_messages(
+                chat_history=history, question=question
             )
+            response = llm.invoke(rendered)
+            standalone = response.content
             logger.debug("Standalone question: %s", standalone)
-            return {"standalone_question": standalone}
+            return {
+                "standalone_question": standalone,
+                "llm_io": [{
+                    "label": "Condense Question",
+                    "prompt": _format_messages(rendered),
+                    "response": standalone,
+                }],
+            }
         logger.info("First turn — skipping condense step")
-        return {"standalone_question": question}
+        return {"standalone_question": question, "llm_io": []}
 
     def retrieve_node(state: RAGState) -> dict:
         """Retrieve relevant documents using the standalone question."""
@@ -321,17 +355,22 @@ def get_rag_chain():
         history = _build_chat_history(
             state["messages"], state.get("summary", "")
         )
-        answer = answer_chain.invoke(
-            {
-                "context": state["context"],
-                "chat_history": history,
-                "question": state["standalone_question"],
-            }
+        rendered = RAG_PROMPT.format_messages(
+            context=state["context"],
+            chat_history=history,
+            question=state["standalone_question"],
         )
+        response = llm.invoke(rendered)
+        answer = response.content
         logger.debug("Answer length: %d characters", len(answer))
         return {
             "answer": answer,
             "messages": [AIMessage(content=answer)],
+            "llm_io": [{
+                "label": "Generate Answer",
+                "prompt": _format_messages(rendered),
+                "response": answer,
+            }],
         }
 
     # ─── Build the Graph ──────────────────────────────────────────────────
