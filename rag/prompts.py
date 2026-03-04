@@ -84,7 +84,7 @@ RAG_PROMPT = ChatPromptTemplate.from_messages(
             "it easier to read. \nPlease cite your sources for all facts or figures individually given as part of "
             "the text, for example: \n\nHere's a fact about energy security (Publication 2, Page 11) and here's a fact"
             "about net zero targets (Publication 3, Page 2) \n\nHere's an example of a good answer: \n\n<good_example>"
-            "\nQuestion: How does increased smart meter uptake benefit energy suppliers?\n\nAnswer: "Energy suppliers "
+            "\nQuestion: How does increased smart meter uptake benefit energy suppliers?\n\nAnswer: Energy suppliers "
             "benefit from increased smart meter uptake in several ways, primarily through operational efficiencies, "
             "improved customer engagement, and opportunities for innovation. Below is a summary of the key benefits:"
             "\n1. Operational Cost Savings\nAvoided Meter Readings: Smart meters eliminate the need for manual meter"
