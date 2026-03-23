@@ -238,14 +238,11 @@ elif prompt := st.chat_input("Ask a question about your documents"):
             # total). This captures ALL LLM calls in the pipeline:
             # condense, summarize, and answer generation.
             # Per-invocation Langfuse handler with user/session tracking.
-            # session_id groups all turns in one conversation; user_id
-            # identifies the browser tab (no auth, so UUID is the best we have).
+            # In the Python SDK, user_id and session_id are passed via the
+            # metadata dict in config, not as constructor args.
             from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
-            langfuse_handler = LangfuseCallbackHandler(
-                user_id=st.session_state.session_id,
-                session_id=st.session_state.session_id,
-            )
+            langfuse_handler = LangfuseCallbackHandler()
 
             start_time = time.perf_counter()
             with get_openai_callback() as cb:
@@ -256,6 +253,10 @@ elif prompt := st.chat_input("Ask a question about your documents"):
                             "thread_id": st.session_state.session_id,
                         },
                         "callbacks": [langfuse_handler],
+                        "metadata": {
+                            "langfuse_user_id": st.session_state.session_id,
+                            "langfuse_session_id": st.session_state.session_id,
+                        },
                     },
                 )
             elapsed = time.perf_counter() - start_time
