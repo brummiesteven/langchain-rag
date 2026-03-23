@@ -195,13 +195,14 @@ for msg_idx, msg in enumerate(st.session_state.messages):
                 disabled=msg.get("feedback_sent", False),
             )
             if feedback is not None and not msg.get("feedback_sent"):
-                from langfuse import Langfuse
+                from langfuse import get_client
 
-                langfuse_client = Langfuse()
-                langfuse_client.score(
+                langfuse_client = get_client()
+                langfuse_client.create_score(
                     trace_id=msg["trace_id"],
                     name="user_feedback",
-                    value=feedback,  # 0 = thumbs down, 1 = thumbs up
+                    value=feedback,
+                    data_type="NUMERIC",
                 )
                 msg["feedback_sent"] = True
                 st.toast("Thanks for your feedback!")
