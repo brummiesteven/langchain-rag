@@ -73,7 +73,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_core.messages.utils import count_tokens_approximately
-from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.graph.message import add_messages  # noqa: F401 — required for get_type_hints() on Python 3.9
@@ -403,13 +402,9 @@ def get_rag_chain():
 
     # compile() freezes the graph structure and attaches the checkpointer.
     # The checkpointer persists state between invocations (conversation memory).
-    # Langfuse callback handler traces all LLM calls, retrieval steps, and
-    # graph node transitions — visible in the Langfuse dashboard for debugging
-    # and observability. Reads LANGFUSE_* env vars automatically.
-    langfuse_handler = LangfuseCallbackHandler()
-    return builder.compile(checkpointer=_checkpointer).with_config(
-        {"callbacks": [langfuse_handler]}
-    )
+    # Langfuse tracing is attached per-invocation in app.py so we can pass
+    # user_id and session_id for tracking in the Langfuse dashboard.
+    return builder.compile(checkpointer=_checkpointer)
 
 
 def clear_session_history(graph, thread_id: str) -> None:
