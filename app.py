@@ -315,7 +315,7 @@ elif prompt := st.chat_input("Ask a question about your documents"):
                     st.code(call["response"], language=None)
 
     # Grab the Langfuse trace ID so we can attach user feedback scores later.
-    trace_id = langfuse_handler.get_trace_id()
+    trace_id = langfuse_handler.last_trace_id
 
     # 3. Save the assistant's response to session state for re-rendering
     st.session_state.messages.append(
