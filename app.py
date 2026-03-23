@@ -314,14 +314,34 @@ elif prompt := st.chat_input("Ask a question about your documents"):
                     st.markdown("**Response:**")
                     st.code(call["response"], language=None)
 
-    # Grab the Langfuse trace ID so we can attach user feedback scores later.
-    trace_id = langfuse_handler.last_trace_id
+        # Grab the Langfuse trace ID so we can attach user feedback scores.
+        trace_id = langfuse_handler.last_trace_id
+
+        # Show thumbs up/down for the just-generated response.
+        # Uses msg_count to create a unique key that won't collide with
+        # the feedback widgets rendered in the history re-render loop above.
+        feedback = st.feedback(
+            "thumbs",
+            key=f"feedback_live_{len(st.session_state.messages)}",
+        )
 
     # 3. Save the assistant's response to session state for re-rendering
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "sources": sources,
          "llm_io": llm_io, "trace_id": trace_id}
     )
+
+    # If user clicked feedback on the same rerun, send score to Langfuse
+    if feedback is not None:
+        from langfuse import Langfuse
+
+        langfuse_client = Langfuse()
+        langfuse_client.score(
+            trace_id=trace_id,
+            name="user_feedback",
+            value=feedback,
+        )
+        st.session_state.messages[-1]["feedback_sent"] = True
 
 # ─── Sidebar: Conversation Status ────────────────────────────────────────────
 # Rendered AFTER the chat input handler so st.session_state.messages includes
