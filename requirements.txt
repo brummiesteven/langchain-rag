@@ -10,3 +10,4 @@ python-dotenv>=1.0.0
 azure-identity>=1.14.0
 azure-keyvault-secrets>=4.7.0
 pypdf>=4.0.0
+langfuse>=2.0.0
