@@ -168,7 +168,7 @@ with st.sidebar:
 # Re-render all previous messages from session_state on each rerun.
 # This is how Streamlit maintains the chat history visually — the actual
 # data lives in st.session_state.messages, and we re-draw it each time.
-for msg in st.session_state.messages:
+for msg_idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         # If this message has source citations, show them in a collapsible section
@@ -185,6 +185,26 @@ for msg in st.session_state.messages:
                     st.code(call["prompt"], language=None)
                     st.markdown("**Response:**")
                     st.code(call["response"], language=None)
+        # Thumbs up/down feedback for assistant messages with a Langfuse trace.
+        # st.feedback returns 0 (thumbs down) or 1 (thumbs up), or None if
+        # no selection yet. Scores are sent to Langfuse tied to the trace.
+        if msg.get("trace_id"):
+            feedback = st.feedback(
+                "thumbs",
+                key=f"feedback_{msg_idx}",
+                disabled=msg.get("feedback_sent", False),
+            )
+            if feedback is not None and not msg.get("feedback_sent"):
+                from langfuse import Langfuse
+
+                langfuse_client = Langfuse()
+                langfuse_client.score(
+                    trace_id=msg["trace_id"],
+                    name="user_feedback",
+                    value=feedback,  # 0 = thumbs down, 1 = thumbs up
+                )
+                msg["feedback_sent"] = True
+                st.toast("Thanks for your feedback!")
 
 # ─── Chat Input ───────────────────────────────────────────────────────────────
 # st.chat_input returns the user's message when they press Enter, or None.
@@ -293,9 +313,13 @@ elif prompt := st.chat_input("Ask a question about your documents"):
                     st.markdown("**Response:**")
                     st.code(call["response"], language=None)
 
+    # Grab the Langfuse trace ID so we can attach user feedback scores later.
+    trace_id = langfuse_handler.get_trace_id()
+
     # 3. Save the assistant's response to session state for re-rendering
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources, "llm_io": llm_io}
+        {"role": "assistant", "content": answer, "sources": sources,
+         "llm_io": llm_io, "trace_id": trace_id}
     )
 
 # ─── Sidebar: Conversation Status ────────────────────────────────────────────
